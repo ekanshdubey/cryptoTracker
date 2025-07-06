@@ -1,134 +1,169 @@
+import com.opencsv.CSVWriter;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.*;
 import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.net.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.text.SimpleDateFormat;
 import java.util.*;
-import com.opencsv.CSVWriter;
-import org.json.*;
 
 public class EtherscanWalletScraper {
 
-    private static final String API_KEY = "<Your API KEY>";
-    private static final String WALLET_ADDRESS = "0xfb50526f49894b78541b776f5aaefe43e3bd8590"; // Replace
+    public static String API_KEY;
+    public static String WALLET_ADDRESS;
 
-    public static void main(String[] args) throws IOException {
-        List<String[]> allData = new ArrayList<>();
+    private static final String BASE_URL = "https://api.etherscan.io/api?module=account&action=";
 
-        fetchAndAppend("txlist", "Normal Transaction", allData);
-        fetchAndAppend("txlistinternal", "Internal Transaction", allData);
-        fetchAndAppend("tokentx", "ERC20 Token Transfer", allData);
-        fetchAndAppend("tokennfttx", "ERC721 NFT Transfer", allData);
-        fetchAndAppend("token1155tx", "ERC1155 Token Transfer", allData);
+    public static void main(String[] args) {
+        loadConfig();
 
-        writeCsv("wallet_transactions.csv", allData);
-        System.out.println("Done! CSV saved.");
-    }
-
-    private static void fetchAndAppend(String action, String category, List<String[]> data) throws IOException {
-        String urlStr = String.format(
-                "https://api.etherscan.io/api?module=account&action=%s&address=%s&startblock=0&endblock=99999999&page=1&offset=10000&sort=asc&apikey=%s",
-                action, WALLET_ADDRESS, API_KEY);
-
-        URL url = new URL(urlStr);
-        HttpURLConnection con = (HttpURLConnection) url.openConnection();
-        con.setRequestMethod("GET");
-
-        BufferedReader in = new BufferedReader(
-                new InputStreamReader(con.getInputStream()));
-        String inputLine;
-        StringBuilder content = new StringBuilder();
-
-        while ((inputLine = in.readLine()) != null) {
-            content.append(inputLine);
-        }
-
-        in.close();
-        con.disconnect();
-
-        JSONObject response = new JSONObject(content.toString());
-        if (!response.getString("status").equals("1")) {
-            System.err.println("Error fetching " + category + ": " + response.getString("message"));
+        if (API_KEY == null || WALLET_ADDRESS == null) {
+            System.err.println("Missing API key or wallet address in config.properties.");
             return;
         }
 
-        JSONArray txArray = response.getJSONArray("result");
-        for (int i = 0; i < txArray.length(); i++) {
-            JSONObject tx = txArray.getJSONObject(i);
-            data.add(parseTransaction(tx, category));
+        List<String[]> allTxs = new ArrayList<>();
+        allTxs.add(getCsvHeader());
+
+        String[][] txTypes = {
+                {"txlist", "ETH Transfer"},
+                {"txlistinternal", "Internal Tx"},
+                {"tokentx", "ERC-20 Transfer"},
+                {"tokennfttx", "ERC-721 Transfer"},
+                {"token1155tx", "ERC-1155 Transfer"}
+        };
+
+        for (String[] type : txTypes) {
+            try {
+                String response = getApiResponse(type[0]);
+                if (response == null) {
+                    System.out.println("No data for: " + type[1]);
+                    continue;
+                }
+                allTxs.addAll(parseTransactions(response, type[1]));
+            } catch (Exception e) {
+                System.err.println("Error processing " + type[1] + ": " + e.getMessage());
+            }
+        }
+
+        writeCsv(allTxs);
+        System.out.println("✅ Done! Transactions saved to wallet_transactions.csv");
+    }
+
+    public static void loadConfig() {
+        Properties prop = new Properties();
+        try (FileInputStream input = new FileInputStream("config.properties")) {
+            prop.load(input);
+            API_KEY = prop.getProperty("apiKey");
+            WALLET_ADDRESS = prop.getProperty("walletAddress");
+        } catch (IOException e) {
+            System.err.println("Failed to load config.properties: " + e.getMessage());
         }
     }
 
-    private static String[] parseTransaction(JSONObject tx, String category) {
-        String hash = tx.optString("hash");
-        long timestamp = tx.optLong("timeStamp", 0);
-        String dateTime = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-                .format(new java.util.Date(timestamp * 1000L));
+    public static String getApiResponse(String action) {
+        try {
+            String url = BASE_URL + action + "&address=" + WALLET_ADDRESS + "&apikey=" + API_KEY;
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("GET");
 
-        String from = tx.optString("from");
-        String to = tx.optString("to");
+            if (conn.getResponseCode() != 200) {
+                System.err.println("HTTP error: " + conn.getResponseCode());
+                return null;
+            }
 
-        String contractAddress = tx.optString("contractAddress", "");
-        String tokenSymbol = tx.optString("tokenSymbol", "");
-        String tokenName = tx.optString("tokenName", "");
-        String tokenID = tx.optString("tokenID", ""); // for NFTs
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                StringBuilder json = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    json.append(line);
+                }
 
-        String value = tx.optString("value", "0");
-        // Convert from Wei to ETH or token units
-        String readableValue = convertWeiToEth(value);
+                JSONObject obj = new JSONObject(json.toString());
+                if (obj.has("status") && obj.getString("status").equals("0")) {
+                    System.err.println("API Error: " + obj.optString("result"));
+                    return null;
+                }
 
-        // Gas fee in ETH = gasUsed * gasPrice / 1e18
-        String gasUsed = tx.optString("gasUsed", "0");
-        String gasPrice = tx.optString("gasPrice", "0");
-        String gasFeeEth = calculateGasFee(gasUsed, gasPrice);
+                return json.toString();
+            }
+        } catch (IOException e) {
+            System.err.println("Connection error: " + e.getMessage());
+            return null;
+        }
+    }
 
-        return new String[]{
-                hash,
-                dateTime,
-                from,
-                to,
-                category,
-                contractAddress,
-                tokenSymbol.isEmpty() ? tokenName : tokenSymbol,
-                tokenID,
-                readableValue,
-                gasFeeEth
+
+    public static List<String[]> parseTransactions(String response, String type) throws Exception {
+        if (response == null || response.isEmpty()) throw new IllegalArgumentException("Empty API response");
+
+        List<String[]> rows = new ArrayList<>();
+        JSONObject json = new JSONObject(response);
+        if (!json.has("result")) return rows;
+
+        JSONArray txs = json.getJSONArray("result");
+
+        for (int i = 0; i < txs.length(); i++) {
+            JSONObject tx = txs.getJSONObject(i);
+
+            String hash = tx.optString("hash");
+            String time = formatUnixTime(tx.optString("timeStamp"));
+            String from = tx.optString("from");
+            String to = tx.optString("to");
+            String contract = tx.optString("contractAddress");
+            String symbol = tx.optString("tokenSymbol", type.contains("ERC-") ? "NFT/Token" : "ETH");
+            String tokenId = tx.optString("tokenID", "");
+            String value = convertWeiToEth(tx.optString("value"));
+            String gasFee = calculateGasFee(tx.optString("gasUsed"), tx.optString("gasPrice"));
+
+            rows.add(new String[] {
+                    hash, time, from, to, type, contract, symbol, tokenId, value, gasFee
+            });
+        }
+        return rows;
+    }
+
+    public static void writeCsv(List<String[]> data) {
+        try (CSVWriter writer = new CSVWriter(new FileWriter("wallet_transactions.csv"))) {
+            writer.writeAll(data);
+        } catch (IOException e) {
+            System.err.println("Failed to write CSV: " + e.getMessage());
+        }
+    }
+
+    public static String[] getCsvHeader() {
+        return new String[] {
+                "Transaction Hash", "Date & Time", "From Address", "To Address", "Transaction Type",
+                "Asset Contract Address", "Asset Symbol / Name", "Token ID", "Value / Amount", "Gas Fee (ETH)"
         };
     }
 
-    private static String convertWeiToEth(String weiStr) {
+    public static String convertWeiToEth(String wei) {
         try {
-            BigDecimal wei = new BigDecimal(weiStr);
-            return wei.divide(new BigDecimal("1000000000000000000"), 18, RoundingMode.HALF_UP).toPlainString();
+            return new BigDecimal(wei).divide(new BigDecimal("1000000000000000000")).toPlainString();
         } catch (Exception e) {
             return "0";
         }
     }
 
-    private static String calculateGasFee(String gasUsedStr, String gasPriceStr) {
+    public static String calculateGasFee(String gasUsed, String gasPrice) {
         try {
-            BigDecimal gasUsed = new BigDecimal(gasUsedStr);
-            BigDecimal gasPrice = new BigDecimal(gasPriceStr);
-            BigDecimal weiFee = gasUsed.multiply(gasPrice);
-            return convertWeiToEth(weiFee.toPlainString());
+            BigDecimal gas = new BigDecimal(gasUsed);
+            BigDecimal price = new BigDecimal(gasPrice);
+            return gas.multiply(price).divide(new BigDecimal("1000000000000000000")).toPlainString();
         } catch (Exception e) {
             return "0";
         }
     }
 
-
-
-    private static void writeCsv(String fileName, List<String[]> data) throws IOException {
-        FileWriter fileWriter = new FileWriter(fileName);
-        CSVWriter writer = new CSVWriter(fileWriter);
-
-        // Header
-        writer.writeNext(new String[]{
-                "Transaction Hash", "Date & Time", "From Address", "To Address",
-                "Transaction Type", "Asset Contract Address", "Asset Symbol / Name",
-                "Token ID", "Value / Amount", "Gas Fee (ETH)"
-        });
-
-        writer.writeAll(data);
-        writer.close();
+    public static String formatUnixTime(String timestamp) {
+        try {
+            long time = Long.parseLong(timestamp) * 1000;
+            return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date(time));
+        } catch (Exception e) {
+            return "";
+        }
     }
 }
